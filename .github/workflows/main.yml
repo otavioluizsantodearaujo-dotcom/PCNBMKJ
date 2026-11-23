@@ -1,0 +1,153 @@
+name: AnyDesk-VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      segundos:
+        description: "Tempo ativo para outros usuarios (segundos)"
+        default: "2000"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  vm:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Criar usuario com senha aleatoria
+        shell: pwsh
+        run: |
+          $up  = [char[]]'ABCDEFGHJKLMNPQRSTUVWXYZ'
+          $low = [char[]]'abcdefghijkmnopqrstuvwxyz'
+          $num = [char[]]'23456789'
+          $sp  = [char[]]'@#_-'
+          $all = $up + $low + $num + $sp
+          $p   = @()
+          $p  += $up  | Get-Random -Count 3
+          $p  += $low | Get-Random -Count 3
+          $p  += $num | Get-Random -Count 3
+          $p  += $sp  | Get-Random -Count 2
+          $p  += $all | Get-Random -Count 5
+          $password = -join ($p | Sort-Object { Get-Random })
+
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "Skyro" -Password $secure -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "Skyro"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Skyro"
+          "VM_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Ativar RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-TS" >$null 2>&1
+          netsh advfirewall firewall add rule name="RDP-TS" `
+            dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Instalar Tailscale
+        shell: pwsh
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $msi = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
+          Remove-Item $msi -Force
+
+      - name: Conectar Tailscale e pegar IP
+        shell: pwsh
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $ip = $null
+          for ($i = 0; $i -lt 15; $i++) {
+              Start-Sleep -Seconds 5
+              $ip = (& $ts ip -4 2>$null | Out-String).Trim()
+              if ($ip -match '^\d{1,3}(\.\d{1,3}){3}$') { break }
+              $ip = $null
+          }
+
+          if (-not $ip) { Write-Error "IP Tailscale nao obtido"; exit 1 }
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Manter VM ativa
+        shell: pwsh
+        env:
+          DONO: "otavioluizsantodearaujo-dotcom"
+          ATOR: "${{ github.actor }}"
+          SEGUNDOS: "${{ github.event.inputs.segundos }}"
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          REPO: "${{ github.repository }}"
+          BRANCH: "${{ github.ref_name }}"
+        run: |
+          $atorLower = $env:ATOR.ToLower().Trim()
+          $donoLower = $env:DONO.ToLower().Trim()
+
+          Write-Host ""
+          Write-Host "========== ACESSO RDP + TAILSCALE =========="
+          Write-Host "IP Tailscale: $env:TAILSCALE_IP"
+          Write-Host "Usuario:      Skyro"
+          Write-Host "Senha:        $env:VM_PASS"
+          Write-Host "Porta RDP:    3389"
+          Write-Host "============================================"
+          Write-Host "Quem rodou:   $atorLower"
+          Write-Host ""
+
+          if ($atorLower -eq $donoLower) {
+              Write-Host ">>> DONO CONFIRMADO - Acesso permanente ativado <<<"
+              Write-Host ""
+
+              $fim = (Get-Date).AddMinutes(320)
+              while ((Get-Date) -lt $fim) {
+                  $min = [int]($fim - (Get-Date)).TotalMinutes
+                  Write-Host "[$(Get-Date -Format T)] VM permanente | IP: $env:TAILSCALE_IP | Reinicio em: ${min} min"
+                  Start-Sleep -Seconds 60
+              }
+
+              Write-Host ""
+              Write-Host ">>> Reiniciando ciclo automaticamente... <<<"
+
+              $headers = @{
+                  "Authorization"        = "Bearer $env:GH_TOKEN"
+                  "Accept"               = "application/vnd.github+json"
+                  "X-GitHub-Api-Version" = "2022-11-28"
+              }
+              $body = @{
+                  ref    = $env:BRANCH
+                  inputs = @{ segundos = "2000" }
+              } | ConvertTo-Json
+
+              try {
+                  Invoke-RestMethod `
+                    -Uri "https://api.github.com/repos/$env:REPO/actions/workflows/anydesk.yml/dispatches" `
+                    -Method POST `
+                    -Headers $headers `
+                    -Body $body `
+                    -ContentType "application/json"
+                  Write-Host ">>> Novo ciclo iniciado! Pegue o novo IP nos logs. <<<"
+              } catch {
+                  Write-Host "Erro ao reiniciar: $_"
+              }
+
+          } else {
+              Write-Host ">>> Usuario externo - Tempo: $env:SEGUNDOS segundos <<<"
+              Write-Host ""
+              $total = [int]$env:SEGUNDOS
+              $fim   = (Get-Date).AddSeconds($total)
+              while ((Get-Date) -lt $fim) {
+                  $resta = [int]($fim - (Get-Date)).TotalSeconds
+                  Write-Host "[$(Get-Date -Format T)] VM ativa - restam ${resta}s | IP: $env:TAILSCALE_IP"
+                  Start-Sleep -Seconds 30
+              }
+              Write-Host "Tempo encerrado."
+          }
